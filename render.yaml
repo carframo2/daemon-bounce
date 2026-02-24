@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: daemon-bounce
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --threads 4 --timeout 120
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: NOTION_WATCH_PAGE_TITLE
+        value: test_bridge
+      - key: BOUNCE_MAX_HOPS
+        value: "1"
+      - key: GROQ_WARMUP_COOLDOWN_SEC
+        value: "1500"
+
+  # Opcional: cron en Render (si tu plan lo permite)
+  # - type: cron
+  #   name: daemon-bounce-tick
+  #   schedule: "*/1 * * * *"
+  #   env: python
+  #   buildCommand: pip install -r requirements.txt
+  #   startCommand: 'curl -fsS "https://tu-daemon.onrender.com/tick?token=TU_DAEMON_TOKEN" || true'
