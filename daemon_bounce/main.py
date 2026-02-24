@@ -5,5 +5,5 @@ from .routes import bp
 
 def create_app() -> Flask:
     app = Flask(__name__)
-    app.register_blueprint(bp)
+    app.register_blueprinxt(bp)
     return app
