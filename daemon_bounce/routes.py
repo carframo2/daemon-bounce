@@ -109,6 +109,22 @@ def _watch_page_title() -> str:
     return (_env('NOTION_WATCH_PAGE_TITLE', 'test_bridge') or 'test_bridge').strip()
 
 
+def _tick_forward_mode() -> str:
+    """Modo de forwarding del tick:
+    - first_url: reenvía la primera URL encontrada en Notion (comportamiento original)
+    - relay:    ignora la URL como destino y dispara RELAY_TRIGGER_URL
+                (usa la URL real solo para dedupe/trigger)
+    """
+    raw = (request.args.get('forward_mode') or _env('TICK_FORWARD_MODE', 'first_url') or 'first_url').strip().lower()
+    if raw in ('relay', 'relay_url', 'trigger', 'trigger_url'):
+        return 'relay'
+    return 'first_url'
+
+
+def _relay_trigger_url() -> str:
+    return (request.args.get('relay_url') or _env('RELAY_TRIGGER_URL', '') or '').strip()
+
+
 def _resolve_watch_page(*, timeout_sec: float) -> Dict[str, Any]:
     token = _notion_token()
     if not token:
@@ -173,11 +189,13 @@ def health():
     return jsonify(
         ok=True,
         service='daemon-bounce',
-        version='1.0.0',
+        version='1.1.0',
         now=now_ts(),
         has_notion_token=bool(_notion_token()),
         watch_page_id=bool(_watch_page_id()),
         watch_page_title=_watch_page_title(),
+        tick_forward_mode=(_env('TICK_FORWARD_MODE', 'first_url') or 'first_url'),
+        has_relay_trigger_url=bool((_env('RELAY_TRIGGER_URL', '') or '').strip()),
         state_file=_state_path(),
     )
 
@@ -286,6 +304,22 @@ def tick():
         'force': bool(force),
     }
 
+    trigger_mode = _tick_forward_mode()
+    target_url = first_url
+    if trigger_mode == 'relay':
+        target_url = _relay_trigger_url()
+        if debug:
+            base_resp['trigger'] = {
+                'mode': 'relay',
+                'target_url': target_url or None,
+                'source_url_for_dedupe': first_url,
+            }
+    elif debug:
+        base_resp['trigger'] = {
+            'mode': 'first_url',
+            'target_url': first_url,
+        }
+
     if not first_url:
         nst['last_result'] = {'status': 'no_url', 'checked_at': now_ts()}
         _save_state(state)
@@ -296,6 +330,15 @@ def tick():
         base_resp['sample_urls'] = urls[:10]
         return jsonify(base_resp)
 
+    if trigger_mode == 'relay' and not target_url:
+        nst['last_error'] = 'Falta RELAY_TRIGGER_URL (o relay_url) para TICK_FORWARD_MODE=relay'
+        nst['last_result'] = {'status': 'relay_target_missing', 'checked_at': now_ts()}
+        _save_state(state)
+        if not debug:
+            return jsonify({'ok': False, 'status': 'relay_target_missing'}), 500
+        base_resp['status'] = 'relay_target_missing'
+        return jsonify(base_resp), 500
+
     if not changed and not force:
         nst['last_result'] = {'status': 'no_change', 'checked_at': now_ts()}
         _save_state(state)
@@ -305,21 +348,23 @@ def tick():
         return jsonify(base_resp)
 
     if not run:
-        nst['last_result'] = {'status': 'dry_run', 'checked_at': now_ts(), 'url': first_url}
+        nst['last_result'] = {'status': 'dry_run', 'checked_at': now_ts(), 'url': target_url, 'source_first_url': first_url, 'trigger_mode': trigger_mode}
         _save_state(state)
         if not debug:
-            return jsonify({'ok': True, 'status': 'dry_run', 'url': first_url})
+            return jsonify({'ok': True, 'status': 'dry_run', 'url': target_url, 'trigger_mode': trigger_mode})
         base_resp['status'] = 'dry_run'
         return jsonify(base_resp)
 
     try:
-        fwd = _forward_url(first_url, timeout_sec=float(_env('BOUNCE_TIMEOUT_SEC', '20')), max_hops=max_hops, debug=debug)
+        fwd = _forward_url(target_url, timeout_sec=float(_env('BOUNCE_TIMEOUT_SEC', '20')), max_hops=max_hops, debug=debug)
         triggered_at = now_ts()
         nst['last_page_sig_forwarded'] = sig
         nst['last_result'] = {
             'status': 'forwarded',
             'triggered_at': triggered_at,
-            'requested_url_hash': sha256_text(first_url),
+            'trigger_mode': trigger_mode,
+            'source_first_url_hash': sha256_text(first_url or ''),
+            'requested_url_hash': sha256_text(target_url or ''),
             'status_code': fwd.get('status_code'),
             'ok': fwd.get('ok'),
             'latency_ms': fwd.get('latency_ms'),
@@ -329,7 +374,7 @@ def tick():
         nst['last_error'] = str(e)
         nst['last_result'] = {'status': 'forward_error', 'checked_at': now_ts()}
         _save_state(state)
-        return _json_error(f'Forward error: {e}', 502, url=first_url)
+        return _json_error(f'Forward error: {e}', 502, url=target_url, trigger_mode=trigger_mode, source_first_url=first_url)
 
     if not debug:
         # compacto para cron. JSON mínimo.
@@ -337,6 +382,7 @@ def tick():
 
     base_resp['status'] = 'forwarded'
     base_resp['forward_result'] = fwd
+    base_resp['forwarded_to'] = target_url
     base_resp['duration_ms'] = int((time.perf_counter() - t0) * 1000)
     return jsonify(base_resp)
 
